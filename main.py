@@ -255,7 +255,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
         until=daily_until,
         level="account",
         time_increment="1",
-        fields=["actions"],
+        fields=["instagram_profile_visits"],
     )
 
     for item in day_rows:
@@ -286,7 +286,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
             until=month_range["until"],
             level="account",
             time_increment="monthly",
-            fields=["actions"],
+            fields=["instagram_profile_visits"],
         )
 
         for item in month_rows:
@@ -314,7 +314,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
             until=month_range["until"],
             level="ad",
             time_increment="monthly",
-            fields=["campaign_name", "adset_name", "ad_name", "actions"],
+            fields=["campaign_name", "adset_name", "ad_name", "instagram_profile_visits"],
         )
 
         for item in ad_rows:
@@ -346,7 +346,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
                 until=month_range["until"],
                 level="campaign",
                 time_increment="monthly",
-                fields=["campaign_name", "actions"],
+                fields=["campaign_name", "instagram_profile_visits"],
                 breakdowns=[breakdown_name],
             )
 
@@ -429,7 +429,7 @@ def fetch_meta_insights(
 
 
 def extract_instagram_profile_visits(item):
-    actions = item.get("actions", [])
+    return to_int(item.get("instagram_profile_visits"))
 
     if not isinstance(actions, list):
         return 0
