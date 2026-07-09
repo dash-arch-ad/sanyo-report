@@ -72,13 +72,13 @@ def main():
 
     write_meta_sheet(
         spreadsheet=spreadsheet,
-        sheet_name=META_WORKSHEET_NAME,
+        sheet_name=resolved["sheet"]["meta_worksheet_name"],
         rows=sort_meta_rows(meta_rows),
     )
 
     write_google_sheet(
         spreadsheet=spreadsheet,
-        sheet_name=GOOGLE_WORKSHEET_NAME,
+        sheet_name=resolved["sheet"]["google_worksheet_name"],
         rows=sort_google_rows(google_rows),
     )
 
@@ -133,7 +133,7 @@ def resolve_config(config):
     return {
         "meta": {
             "token": meta_conf.get("token") or config.get("m_token"),
-            "account_id": meta_conf.get("account_id") or config.get("m_act_id"),
+            "account_ids": meta_conf.get("account_ids") or [meta_conf.get("account_id") or config.get("m_act_id")],
         },
         "google_ads": {
             "developer_token": google_ads_conf.get("developer_token"),
@@ -147,9 +147,9 @@ def resolve_config(config):
         },
         "sheet": {
             "spreadsheet_id": sheets_conf.get("spreadsheet_id") or config.get("s_id"),
-            "google_service_account": normalize_google_service_account(
-                google_service_account
-            ),
+            "meta_worksheet_name": sheets_conf.get("meta_worksheet_name") or "gitreport",
+            "google_worksheet_name": sheets_conf.get("google_worksheet_name") or "gitreport2",
+            "google_service_account": normalize_google_service_account(google_service_account),
         },
     }
 
