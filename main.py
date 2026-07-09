@@ -85,8 +85,8 @@ def load_secret():
         raise RuntimeError(f"APP_SECRET_JSON is invalid JSON: {e}") from e
 
 
-# CodeQL対策：GitHubログへsecret値をprintしない
 def mask_sensitive_values(config):
+    # CodeQL対策：secret値をGitHubログへ出力しない
     return
 
 
@@ -95,17 +95,23 @@ def resolve_config(config):
     google_ads_conf = config.get("google_ads", {})
     sheets_conf = config.get("sheets", {})
 
-    account_ids = meta_conf.get("account_ids")
-    if not account_ids:
+    accounts = meta_conf.get("accounts")
+    if not accounts:
+        # 旧形式への保険
+        account_ids = meta_conf.get("account_ids", [])
+        accounts = [{"id": account_id, "name": account_id} for account_id in account_ids]
+
+    if not accounts:
         single_account_id = meta_conf.get("account_id") or config.get("m_act_id")
-        account_ids = [single_account_id] if single_account_id else []
+        if single_account_id:
+            accounts = [{"id": single_account_id, "name": single_account_id}]
 
     google_service_account = config.get("gcp_service_account") or config.get("g_creds")
 
     return {
         "meta": {
             "token": meta_conf.get("token") or config.get("m_token"),
-            "accounts": meta_conf.get("accounts", []),
+            "accounts": accounts or [],
         },
         "google_ads": {
             "developer_token": google_ads_conf.get("developer_token"),
@@ -227,20 +233,38 @@ def iter_dates(since, until):
         current += timedelta(days=1)
 
 
-def fetch_meta_rows(act_id, account_name, token, ranges_2m, ranges_6m, daily_since, daily_until):
+def add_total_to_dict(target, key, value):
+    target[key] = target.get(key, 0) + to_int(value)
+
+
+def fetch_meta_rows(
+    act_id,
+    account_name,
+    token,
+    ranges_2m,
+    ranges_6m,
+    daily_since,
+    daily_until,
+):
     normalized_act_id = normalize_meta_act_id(act_id)
     account_label = account_name
     rows = []
 
+    # day：campaign levelで日別取得 → アカウント単位に合算
     day_items = fetch_meta_insights(
         act_id=normalized_act_id,
         token=token,
         since=daily_since,
         until=daily_until,
-        level="account",
+        level="campaign",
         time_increment="1",
-        fields=["instagram_profile_visits"],
+        fields=[
+            "campaign_name",
+            "instagram_profile_visits",
+        ],
     )
+
+    day_totals = {}
 
     for item in day_items:
         value = extract_instagram_profile_visits(item)
@@ -248,9 +272,15 @@ def fetch_meta_rows(act_id, account_name, token, ranges_2m, ranges_6m, daily_sin
             continue
 
         day = item.get("date_start", "")
+        month = day[:7] if day else ""
+
+        key = (month, day)
+        add_total_to_dict(day_totals, key, value)
+
+    for (month, day), value in day_totals.items():
         rows.append(make_meta_row(
             scope="day",
-            month=day[:7],
+            month=month,
             day=day,
             account=account_label,
             campaign="",
@@ -260,15 +290,21 @@ def fetch_meta_rows(act_id, account_name, token, ranges_2m, ranges_6m, daily_sin
             instagram_profile_visits=value,
         ))
 
+    # month：campaign levelで月別取得 → アカウント単位に合算
+    month_totals = {}
+
     for month_range in ranges_6m:
         month_items = fetch_meta_insights(
             act_id=normalized_act_id,
             token=token,
             since=month_range["since"],
             until=month_range["until"],
-            level="account",
+            level="campaign",
             time_increment="monthly",
-            fields=["instagram_profile_visits"],
+            fields=[
+                "campaign_name",
+                "instagram_profile_visits",
+            ],
         )
 
         for item in month_items:
@@ -276,18 +312,23 @@ def fetch_meta_rows(act_id, account_name, token, ranges_2m, ranges_6m, daily_sin
             if value <= 0:
                 continue
 
-            rows.append(make_meta_row(
-                scope="month",
-                month=month_range["month"],
-                day="",
-                account=account_label,
-                campaign="",
-                adset="",
-                ad="",
-                detail="",
-                instagram_profile_visits=value,
-            ))
+            key = month_range["month"]
+            add_total_to_dict(month_totals, key, value)
 
+    for month, value in month_totals.items():
+        rows.append(make_meta_row(
+            scope="month",
+            month=month,
+            day="",
+            account=account_label,
+            campaign="",
+            adset="",
+            ad="",
+            detail="",
+            instagram_profile_visits=value,
+        ))
+
+    # ad：キャンペーン別×広告セット別×広告別×月別
     for month_range in ranges_2m:
         ad_items = fetch_meta_insights(
             act_id=normalized_act_id,
@@ -321,6 +362,7 @@ def fetch_meta_rows(act_id, account_name, token, ranges_2m, ranges_6m, daily_sin
                 instagram_profile_visits=value,
             ))
 
+        # campaign_gen / campaign_age / campaign_pf
         for scope_name, breakdown_name in [
             ("campaign_gen", "gender"),
             ("campaign_age", "age"),
@@ -744,9 +786,7 @@ def write_google_sheet(spreadsheet, sheet_name, rows):
 
 def write_rows(spreadsheet, sheet_name, header, rows):
     try:
-        # CodeQL対策：シートは自動作成しない。事前に作成しておく。
         worksheet = spreadsheet.worksheet(sheet_name)
-
         worksheet.clear()
         worksheet.update("A1", header + rows, value_input_option="USER_ENTERED")
 
