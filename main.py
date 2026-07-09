@@ -6,19 +6,30 @@ from zoneinfo import ZoneInfo
 from datetime import datetime, date, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 
-GOOGLE_ADS_API_VERSION = "v23"
+META_API_VERSION = "v25.0"
+GOOGLE_ADS_API_VERSION = "v24"
 JST = ZoneInfo("Asia/Tokyo")
-DEFAULT_WORKSHEET_NAME = "gitreport"
 
-TARGET_CHANNELS = {
+META_WORKSHEET_NAME = "gitreport"
+GOOGLE_WORKSHEET_NAME = "gitreport2"
+
+GOOGLE_MAX_DAYS = 92
+
+GOOGLE_CHANNELS = {
     "VIDEO": "YouTube",
     "DISPLAY": "Googleディスプレイ",
     "DEMAND_GEN": "デマンドジェネレーション",
 }
 
+META_PROFILE_VISIT_ACTION_KEYWORDS = [
+    "instagram_profile_visit",
+    "instagram_profile_visits",
+    "profile_visit",
+]
+
 
 def main():
-    print("=== Start Google Ads Unique Users Export ===")
+    print("=== Start Meta + Google Export ===")
 
     config = load_secret()
     mask_sensitive_values(config)
@@ -26,35 +37,53 @@ def main():
     resolved = resolve_config(config)
     validate_config(resolved)
 
-    monthly_ranges, daily_since, daily_until = get_target_date_ranges()
+    meta_monthly_ranges, meta_daily_since, meta_daily_until = get_meta_target_ranges()
+    google_monthly_ranges, google_daily_since, google_daily_until = get_google_target_ranges()
 
-    print("Target monthly ranges:")
-    for r in monthly_ranges:
+    print("Meta monthly ranges:")
+    for r in meta_monthly_ranges:
         print(f"- {r['month']} / {r['since']} to {r['until']}")
+    print(f"Meta daily range: {meta_daily_since} to {meta_daily_until}")
 
-    print(f"Target daily range: {daily_since} to {daily_until}")
+    print("Google monthly ranges:")
+    for r in google_monthly_ranges:
+        print(f"- {r['month']} / {r['since']} to {r['until']}")
+    print(f"Google daily range: {google_daily_since} to {google_daily_until}")
 
-    rows = fetch_google_ads_rows(
-        google_ads_conf=resolved["google_ads"],
-        monthly_ranges=monthly_ranges,
-        daily_since=daily_since,
-        daily_until=daily_until,
+    meta_rows = fetch_meta_rows(
+        act_id=resolved["meta"]["account_id"],
+        token=resolved["meta"]["token"],
+        monthly_ranges=meta_monthly_ranges,
+        daily_since=meta_daily_since,
+        daily_until=meta_daily_until,
     )
 
-    rows = sort_rows(rows)
+    google_rows = fetch_google_rows(
+        google_ads_conf=resolved["google_ads"],
+        monthly_ranges=google_monthly_ranges,
+        daily_since=google_daily_since,
+        daily_until=google_daily_until,
+    )
 
     spreadsheet = connect_spreadsheet(
         sheet_id=resolved["sheet"]["spreadsheet_id"],
         google_creds_dict=resolved["sheet"]["google_service_account"],
     )
 
-    write_to_sheet(
+    write_meta_sheet(
         spreadsheet=spreadsheet,
-        sheet_name=resolved["sheet"]["worksheet_name"],
-        rows=rows,
+        sheet_name=META_WORKSHEET_NAME,
+        rows=sort_meta_rows(meta_rows),
     )
 
-    print(f"Total rows written: {len(rows)}")
+    write_google_sheet(
+        spreadsheet=spreadsheet,
+        sheet_name=GOOGLE_WORKSHEET_NAME,
+        rows=sort_google_rows(google_rows),
+    )
+
+    print(f"Meta rows written: {len(meta_rows)}")
+    print(f"Google rows written: {len(google_rows)}")
     print("=== Completed ===")
 
 
@@ -70,35 +99,42 @@ def load_secret():
 
 
 def mask_sensitive_values(config):
+    values = []
+
+    meta = config.get("meta", {})
     google_ads = config.get("google_ads", {})
-    candidates = [
+
+    values.extend([
+        meta.get("token"),
+        meta.get("account_id"),
         google_ads.get("developer_token"),
         google_ads.get("client_id"),
         google_ads.get("client_secret"),
         google_ads.get("refresh_token"),
         google_ads.get("customer_id"),
         google_ads.get("login_customer_id"),
-    ]
+    ])
 
-    for value in sorted(set([str(v).strip() for v in candidates if v])):
+    for value in sorted(set([str(v).strip() for v in values if v])):
         if "\n" not in value:
             print(f"::add-mask::{value}")
 
 
 def resolve_config(config):
+    meta_conf = config.get("meta", {})
     google_ads_conf = config.get("google_ads", {})
     sheets_conf = config.get("sheets", {})
-
-    spreadsheet_id = sheets_conf.get("spreadsheet_id")
-    worksheet_name = sheets_conf.get("worksheet_name") or DEFAULT_WORKSHEET_NAME
 
     google_service_account = (
         config.get("gcp_service_account")
         or config.get("g_creds")
     )
-    google_service_account = normalize_google_service_account(google_service_account)
 
     return {
+        "meta": {
+            "token": meta_conf.get("token") or config.get("m_token"),
+            "account_id": meta_conf.get("account_id") or config.get("m_act_id"),
+        },
         "google_ads": {
             "developer_token": google_ads_conf.get("developer_token"),
             "client_id": google_ads_conf.get("client_id"),
@@ -110,15 +146,18 @@ def resolve_config(config):
             ),
         },
         "sheet": {
-            "spreadsheet_id": spreadsheet_id,
-            "worksheet_name": worksheet_name,
-            "google_service_account": google_service_account,
+            "spreadsheet_id": sheets_conf.get("spreadsheet_id") or config.get("s_id"),
+            "google_service_account": normalize_google_service_account(
+                google_service_account
+            ),
         },
     }
 
 
 def validate_config(resolved):
     required = {
+        "meta.token": resolved["meta"]["token"],
+        "meta.account_id": resolved["meta"]["account_id"],
         "google_ads.developer_token": resolved["google_ads"]["developer_token"],
         "google_ads.client_id": resolved["google_ads"]["client_id"],
         "google_ads.client_secret": resolved["google_ads"]["client_secret"],
@@ -138,17 +177,28 @@ def normalize_google_service_account(creds):
         return None
 
     fixed = dict(creds)
-    private_key = fixed.get("private_key", "")
-    if private_key:
-        fixed["private_key"] = private_key.replace("\\n", "\n")
+
+    if fixed.get("private_key"):
+        fixed["private_key"] = fixed["private_key"].replace("\\n", "\n")
+
     return fixed
 
 
 def normalize_customer_id(value):
     if value is None:
         return None
-    value = str(value).strip().replace("-", "")
-    return value or None
+    return str(value).strip().replace("-", "") or None
+
+
+def normalize_meta_act_id(raw_act_id):
+    cleaned = (
+        str(raw_act_id)
+        .replace("act=", "")
+        .replace("act_", "")
+        .replace("act", "")
+        .strip()
+    )
+    return f"act_{cleaned}"
 
 
 def add_months(base_date, months):
@@ -158,40 +208,84 @@ def add_months(base_date, months):
     return date(year, month, 1)
 
 
-def get_target_date_ranges():
+def get_common_latest_month():
     today_jst = datetime.now(JST).date()
     yesterday = today_jst - timedelta(days=1)
-
     this_month_start = date(today_jst.year, today_jst.month, 1)
 
-    # 1日実行時は「当月1日〜前日」が存在しないため、前月を最新月として扱う
     if yesterday < this_month_start:
         latest_month_start = add_months(this_month_start, -1)
     else:
         latest_month_start = this_month_start
 
-    start_month = add_months(latest_month_start, -2)
+    return today_jst, yesterday, latest_month_start
 
-    monthly_ranges = []
+
+def build_monthly_ranges(start_month, end_month, yesterday, min_start_date=None):
+    ranges = []
     current = start_month
 
-    while current <= latest_month_start:
+    while current <= end_month:
         next_month = add_months(current, 1)
         month_end = next_month - timedelta(days=1)
 
-        monthly_ranges.append({
-            "month": current.strftime("%Y-%m-%d"),
-            "since": current,
-            "until": min(month_end, yesterday),
-        })
+        since = current
+        until = min(month_end, yesterday)
+
+        if min_start_date and until < min_start_date:
+            current = next_month
+            continue
+
+        if min_start_date and since < min_start_date:
+            since = min_start_date
+
+        if since <= until:
+            ranges.append({
+                "month": current.strftime("%Y-%m"),
+                "since": since,
+                "until": until,
+            })
 
         current = next_month
+
+    return ranges
+
+
+def get_meta_target_ranges():
+    _today, yesterday, latest_month_start = get_common_latest_month()
+
+    start_month = add_months(latest_month_start, -5)
+
+    monthly_ranges = build_monthly_ranges(
+        start_month=start_month,
+        end_month=latest_month_start,
+        yesterday=yesterday,
+    )
 
     daily_since = start_month
     daily_until = yesterday
 
-    if daily_since > daily_until:
-        raise RuntimeError("Target daily range is empty")
+    return monthly_ranges, daily_since, daily_until
+
+
+def get_google_target_ranges():
+    _today, yesterday, latest_month_start = get_common_latest_month()
+
+    max_since = yesterday - timedelta(days=GOOGLE_MAX_DAYS - 1)
+
+    six_month_start = add_months(latest_month_start, -5)
+    start_date = max(six_month_start, max_since)
+    start_month = date(start_date.year, start_date.month, 1)
+
+    monthly_ranges = build_monthly_ranges(
+        start_month=start_month,
+        end_month=latest_month_start,
+        yesterday=yesterday,
+        min_start_date=start_date,
+    )
+
+    daily_since = start_date
+    daily_until = yesterday
 
     return monthly_ranges, daily_since, daily_until
 
@@ -203,31 +297,266 @@ def iter_dates(since, until):
         current += timedelta(days=1)
 
 
-def make_output_row(
+def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
+    normalized_act_id = normalize_meta_act_id(act_id)
+    rows = []
+
+    for month_range in monthly_ranges:
+        campaign_rows = fetch_meta_insights(
+            act_id=normalized_act_id,
+            token=token,
+            since=month_range["since"],
+            until=month_range["until"],
+            level="campaign",
+            time_increment="monthly",
+            fields=["campaign_name", "actions"],
+        )
+
+        for item in campaign_rows:
+            value = extract_instagram_profile_visits(item)
+
+            if value <= 0:
+                continue
+
+            rows.append(make_meta_row(
+                scope="campaign",
+                month=month_range["month"],
+                day="",
+                campaign=item.get("campaign_name", ""),
+                ad="",
+                gender="",
+                age="",
+                platform="",
+                instagram_profile_visits=value,
+            ))
+
+    ad_day_rows = fetch_meta_insights(
+        act_id=normalized_act_id,
+        token=token,
+        since=daily_since,
+        until=daily_until,
+        level="ad",
+        time_increment="1",
+        fields=["campaign_name", "adset_name", "ad_name", "actions"],
+    )
+
+    for item in ad_day_rows:
+        value = extract_instagram_profile_visits(item)
+
+        if value <= 0:
+            continue
+
+        day = item.get("date_start", "")
+        month = day[:7] if day else ""
+
+        rows.append(make_meta_row(
+            scope="ad_day",
+            month=month,
+            day=day,
+            campaign=item.get("campaign_name", ""),
+            adset=item.get("adset_name", ""),
+            ad=item.get("ad_name", ""),
+            gender="",
+            age="",
+            platform="",
+            instagram_profile_visits=value,
+        ))
+
+    for month_range in monthly_ranges:
+        gender_rows = fetch_meta_insights(
+            act_id=normalized_act_id,
+            token=token,
+            since=month_range["since"],
+            until=month_range["until"],
+            level="campaign",
+            time_increment="monthly",
+            fields=["campaign_name", "actions"],
+            breakdowns=["gender"],
+        )
+
+        for item in gender_rows:
+            value = extract_instagram_profile_visits(item)
+
+            if value <= 0:
+                continue
+
+            rows.append(make_meta_row(
+                scope="campaign_gen",
+                month=month_range["month"],
+                day="",
+                campaign=item.get("campaign_name", ""),
+                ad="",
+                gender=item.get("gender", ""),
+                age="",
+                platform="",
+                instagram_profile_visits=value,
+            ))
+
+        age_rows = fetch_meta_insights(
+            act_id=normalized_act_id,
+            token=token,
+            since=month_range["since"],
+            until=month_range["until"],
+            level="campaign",
+            time_increment="monthly",
+            fields=["campaign_name", "actions"],
+            breakdowns=["age"],
+        )
+
+        for item in age_rows:
+            value = extract_instagram_profile_visits(item)
+
+            if value <= 0:
+                continue
+
+            rows.append(make_meta_row(
+                scope="campaign_age",
+                month=month_range["month"],
+                day="",
+                campaign=item.get("campaign_name", ""),
+                ad="",
+                gender="",
+                age=item.get("age", ""),
+                platform="",
+                instagram_profile_visits=value,
+            ))
+
+        platform_rows = fetch_meta_insights(
+            act_id=normalized_act_id,
+            token=token,
+            since=month_range["since"],
+            until=month_range["until"],
+            level="campaign",
+            time_increment="monthly",
+            fields=["campaign_name", "actions"],
+            breakdowns=["publisher_platform"],
+        )
+
+        for item in platform_rows:
+            value = extract_instagram_profile_visits(item)
+
+            if value <= 0:
+                continue
+
+            rows.append(make_meta_row(
+                scope="campaign_pf",
+                month=month_range["month"],
+                day="",
+                campaign=item.get("campaign_name", ""),
+                ad="",
+                gender="",
+                age="",
+                platform=item.get("publisher_platform", ""),
+                instagram_profile_visits=value,
+            ))
+
+    return rows
+
+
+def fetch_meta_insights(
+    act_id,
+    token,
+    since,
+    until,
+    level,
+    time_increment,
+    fields,
+    breakdowns=None,
+):
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{act_id}/insights"
+
+    params = {
+        "access_token": token,
+        "level": level,
+        "time_range": json.dumps({
+            "since": since.strftime("%Y-%m-%d"),
+            "until": until.strftime("%Y-%m-%d"),
+        }),
+        "fields": ",".join(fields),
+        "time_increment": time_increment,
+        "limit": 5000,
+    }
+
+    if breakdowns:
+        params["breakdowns"] = ",".join(breakdowns)
+
+    all_rows = []
+
+    while True:
+        response = requests.get(url, params=params, timeout=120)
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            raise RuntimeError(
+                f"Meta API request failed. status={response.status_code}, body={truncate_text(response.text)}"
+            ) from e
+
+        payload = response.json()
+
+        if "error" in payload:
+            raise RuntimeError(
+                f"Meta API error: {json.dumps(payload['error'], ensure_ascii=False)}"
+            )
+
+        all_rows.extend(payload.get("data", []))
+
+        next_url = payload.get("paging", {}).get("next")
+
+        if not next_url:
+            break
+
+        url = next_url
+        params = None
+
+    return all_rows
+
+
+def extract_instagram_profile_visits(item):
+    actions = item.get("actions", [])
+
+    if not isinstance(actions, list):
+        return 0
+
+    total = 0
+
+    for action in actions:
+        action_type = str(action.get("action_type", "")).lower()
+
+        if any(keyword in action_type for keyword in META_PROFILE_VISIT_ACTION_KEYWORDS):
+            total += to_int(action.get("value"))
+
+    return total
+
+
+def make_meta_row(
     scope,
-    month="",
-    day="",
-    channel="",
-    campaign="",
-    unique_users=0,
+    month,
+    day,
+    campaign,
+    adset,
+    ad,
+    gender,
+    age,
+    platform,
+    instagram_profile_visits,
 ):
     return [
-        "Google",
+        "Meta",
         scope,
         month,
         day,
-        channel,
-        campaign,
-        to_int(unique_users),
+        campaign or "",
+        adset or "",
+        ad or "",
+        gender or "",
+        age or "",
+        platform or "",
+        to_int(instagram_profile_visits),
     ]
 
 
-def fetch_google_ads_rows(
-    google_ads_conf,
-    monthly_ranges,
-    daily_since,
-    daily_until,
-):
+def fetch_google_rows(google_ads_conf, monthly_ranges, daily_since, daily_until):
     access_token = refresh_google_ads_access_token(
         client_id=google_ads_conf["client_id"],
         client_secret=google_ads_conf["client_secret"],
@@ -236,10 +565,8 @@ def fetch_google_ads_rows(
 
     rows = []
 
-    # ① チャネル別×月別UU
-    # UUは合算不可のため、チャネルごと・月ごとにsummaryRowで取得
     for month_range in monthly_ranges:
-        for api_channel, output_channel in TARGET_CHANNELS.items():
+        for api_channel, output_channel in GOOGLE_CHANNELS.items():
             query = f"""
                 SELECT
                   campaign.id,
@@ -267,21 +594,22 @@ def fetch_google_ads_rows(
                 default=0,
             )
 
-            rows.append(
-                make_output_row(
-                    scope="channel_month",
-                    month=month_range["month"],
-                    day="",
-                    channel=output_channel,
-                    campaign="",
-                    unique_users=unique_users,
-                )
-            )
+            if to_int(unique_users) <= 0:
+                continue
 
-    # ② チャネル別×日別UU
-    # 日別UUも日付をまたいで合算しない前提で、1日×1チャネルずつ取得
+            rows.append(make_google_row(
+                scope="channel_month",
+                month=month_range["month"],
+                day="",
+                channel=output_channel,
+                campaign="",
+                unique_users=unique_users,
+            ))
+
     for target_day in iter_dates(daily_since, daily_until):
-        for api_channel, output_channel in TARGET_CHANNELS.items():
+        month = target_day.strftime("%Y-%m")
+
+        for api_channel, output_channel in GOOGLE_CHANNELS.items():
             query = f"""
                 SELECT
                   campaign.id,
@@ -309,18 +637,18 @@ def fetch_google_ads_rows(
                 default=0,
             )
 
-            rows.append(
-                make_output_row(
-                    scope="channel_day",
-                    month="",
-                    day=target_day.strftime("%Y-%m-%d"),
-                    channel=output_channel,
-                    campaign="",
-                    unique_users=unique_users,
-                )
-            )
+            if to_int(unique_users) <= 0:
+                continue
 
-    # ③ キャンペーン別×月別UU
+            rows.append(make_google_row(
+                scope="channel_day",
+                month=month,
+                day=target_day.strftime("%Y-%m-%d"),
+                channel=output_channel,
+                campaign="",
+                unique_users=unique_users,
+            ))
+
     for month_range in monthly_ranges:
         query = f"""
             SELECT
@@ -344,6 +672,11 @@ def fetch_google_ads_rows(
         )
 
         for item in response["results"]:
+            unique_users = get_nested(item, "metrics", "uniqueUsers", default=0)
+
+            if to_int(unique_users) <= 0:
+                continue
+
             api_channel = get_nested(
                 item,
                 "campaign",
@@ -351,18 +684,28 @@ def fetch_google_ads_rows(
                 default="",
             )
 
-            rows.append(
-                make_output_row(
-                    scope="campaign_month",
-                    month=month_range["month"],
-                    day="",
-                    channel=TARGET_CHANNELS.get(api_channel, api_channel),
-                    campaign=get_nested(item, "campaign", "name", default=""),
-                    unique_users=get_nested(item, "metrics", "uniqueUsers", default=0),
-                )
-            )
+            rows.append(make_google_row(
+                scope="campaign_month",
+                month=month_range["month"],
+                day="",
+                channel=GOOGLE_CHANNELS.get(api_channel, api_channel),
+                campaign=get_nested(item, "campaign", "name", default=""),
+                unique_users=unique_users,
+            ))
 
     return rows
+
+
+def make_google_row(scope, month, day, channel, campaign, unique_users):
+    return [
+        "Google",
+        scope,
+        month,
+        day,
+        channel or "",
+        campaign or "",
+        to_int(unique_users),
+    ]
 
 
 def refresh_google_ads_access_token(client_id, client_secret, refresh_token):
@@ -481,7 +824,25 @@ def connect_spreadsheet(sheet_id, google_creds_dict):
         raise RuntimeError(f"Google Sheets connection error: {repr(e)}") from e
 
 
-def write_to_sheet(spreadsheet, sheet_name, rows):
+def write_meta_sheet(spreadsheet, sheet_name, rows):
+    header = [[
+        "media",
+        "scope",
+        "month",
+        "day",
+        "campaign",
+        "ad_set",
+        "ad",
+        "gender",
+        "age",
+        "platform",
+        "instagram_profile_visits",
+    ]]
+
+    write_rows(spreadsheet, sheet_name, header, rows, cols=11)
+
+
+def write_google_sheet(spreadsheet, sheet_name, rows):
     header = [[
         "media",
         "scope",
@@ -492,6 +853,10 @@ def write_to_sheet(spreadsheet, sheet_name, rows):
         "unique users",
     ]]
 
+    write_rows(spreadsheet, sheet_name, header, rows, cols=7)
+
+
+def write_rows(spreadsheet, sheet_name, header, rows, cols):
     try:
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
@@ -499,13 +864,11 @@ def write_to_sheet(spreadsheet, sheet_name, rows):
             worksheet = spreadsheet.add_worksheet(
                 title=sheet_name,
                 rows=1000,
-                cols=7,
+                cols=cols,
             )
 
         worksheet.clear()
-
-        output = header + rows
-        worksheet.update("A1", output)
+        worksheet.update("A1", header + rows)
 
         print(f"Write success: {sheet_name} ({len(rows)} rows)")
 
@@ -513,7 +876,48 @@ def write_to_sheet(spreadsheet, sheet_name, rows):
         raise RuntimeError(f"Write error ({sheet_name}): {repr(e)}") from e
 
 
-def sort_rows(rows):
+def sort_meta_rows(rows):
+    scope_order = {
+        "campaign": 0,
+        "ad_day": 1,
+        "campaign_gen": 2,
+        "campaign_age": 3,
+        "campaign_pf": 4,
+    }
+
+    def sort_key(row):
+        (
+            _media,
+            scope,
+            month,
+            day,
+            campaign,
+            adset,
+            ad,
+            gender,
+            age,
+            platform,
+            _value,
+        ) = row
+
+        date_value = day or month or ""
+        date_num = int(date_value.replace("-", "")) if date_value else 0
+
+        return (
+            scope_order.get(scope, 999),
+            -date_num,
+            campaign,
+            adset,
+            ad,
+            gender,
+            age,
+            platform,
+        )
+
+    return sorted(rows, key=sort_key)
+
+
+def sort_google_rows(rows):
     scope_order = {
         "channel_month": 0,
         "channel_day": 1,
@@ -521,9 +925,8 @@ def sort_rows(rows):
     }
 
     def sort_key(row):
-        _media, scope, month, day, channel, campaign, _unique_users = row
-
-        date_value = month or day or ""
+        _media, scope, month, day, channel, campaign, _value = row
+        date_value = day or month or ""
         date_num = int(date_value.replace("-", "")) if date_value else 0
 
         return (
