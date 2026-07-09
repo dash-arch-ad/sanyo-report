@@ -122,10 +122,7 @@ def resolve_config(config):
         single_account_id = meta_conf.get("account_id") or config.get("m_act_id")
         account_ids = [single_account_id] if single_account_id else []
 
-    google_service_account = (
-        config.get("gcp_service_account")
-        or config.get("g_creds")
-    )
+    google_service_account = config.get("gcp_service_account") or config.get("g_creds")
 
     return {
         "meta": {
@@ -266,10 +263,7 @@ def get_meta_target_ranges():
         yesterday=yesterday,
     )
 
-    daily_since = start_month
-    daily_until = yesterday
-
-    return monthly_ranges, daily_since, daily_until
+    return monthly_ranges, start_month, yesterday
 
 
 def get_google_target_ranges():
@@ -288,10 +282,7 @@ def get_google_target_ranges():
         min_start_date=start_date,
     )
 
-    daily_since = start_date
-    daily_until = yesterday
-
-    return monthly_ranges, daily_since, daily_until
+    return monthly_ranges, start_date, yesterday
 
 
 def iter_dates(since, until):
@@ -305,46 +296,17 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
     normalized_act_id = normalize_meta_act_id(act_id)
     rows = []
 
-    for month_range in monthly_ranges:
-        campaign_rows = fetch_meta_insights(
-            act_id=normalized_act_id,
-            token=token,
-            since=month_range["since"],
-            until=month_range["until"],
-            level="campaign",
-            time_increment="monthly",
-            fields=["campaign_name", "actions"],
-        )
-
-        for item in campaign_rows:
-            value = extract_instagram_profile_visits(item)
-            if value <= 0:
-                continue
-
-            rows.append(make_meta_row(
-                scope="campaign",
-                month=month_range["month"],
-                day="",
-                campaign=item.get("campaign_name", ""),
-                adset="",
-                ad="",
-                gender="",
-                age="",
-                platform="",
-                instagram_profile_visits=value,
-            ))
-
-    ad_day_rows = fetch_meta_insights(
+    day_rows = fetch_meta_insights(
         act_id=normalized_act_id,
         token=token,
         since=daily_since,
         until=daily_until,
-        level="ad",
+        level="account",
         time_increment="1",
-        fields=["campaign_name", "adset_name", "ad_name", "actions"],
+        fields=["actions"],
     )
 
-    for item in ad_day_rows:
+    for item in day_rows:
         value = extract_instagram_profile_visits(item)
         if value <= 0:
             continue
@@ -353,12 +315,12 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
         month = day[:7] if day else ""
 
         rows.append(make_meta_row(
-            scope="ad_day",
+            scope="day",
             month=month,
             day=day,
-            campaign=item.get("campaign_name", ""),
-            adset=item.get("adset_name", ""),
-            ad=item.get("ad_name", ""),
+            campaign="",
+            adset="",
+            ad="",
             gender="",
             age="",
             platform="",
@@ -366,6 +328,34 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
         ))
 
     for month_range in monthly_ranges:
+        ad_month_rows = fetch_meta_insights(
+            act_id=normalized_act_id,
+            token=token,
+            since=month_range["since"],
+            until=month_range["until"],
+            level="ad",
+            time_increment="monthly",
+            fields=["campaign_name", "adset_name", "ad_name", "actions"],
+        )
+
+        for item in ad_month_rows:
+            value = extract_instagram_profile_visits(item)
+            if value <= 0:
+                continue
+
+            rows.append(make_meta_row(
+                scope="ad_month",
+                month=month_range["month"],
+                day="",
+                campaign=item.get("campaign_name", ""),
+                adset=item.get("adset_name", ""),
+                ad=item.get("ad_name", ""),
+                gender="",
+                age="",
+                platform="",
+                instagram_profile_visits=value,
+            ))
+
         gender_rows = fetch_meta_insights(
             act_id=normalized_act_id,
             token=token,
@@ -544,7 +534,7 @@ def make_meta_row(
     instagram_profile_visits,
 ):
     return [
-        "Meta",
+        "FB",
         scope,
         month,
         day,
@@ -686,11 +676,13 @@ def fetch_google_rows(google_ads_conf, monthly_ranges, daily_since, daily_until)
                 default="",
             )
 
+            output_channel = GOOGLE_CHANNELS.get(api_channel, api_channel)
+
             rows.append(make_google_row(
                 scope="campaign_month",
                 month=month_range["month"],
                 day="",
-                channel=GOOGLE_CHANNELS.get(api_channel, api_channel),
+                channel=output_channel,
                 campaign=get_nested(item, "campaign", "name", default=""),
                 unique_users=unique_users,
             ))
@@ -700,7 +692,7 @@ def fetch_google_rows(google_ads_conf, monthly_ranges, daily_since, daily_until)
 
 def make_google_row(scope, month, day, channel, campaign, unique_users):
     return [
-        "Google",
+        channel or "",
         scope,
         month,
         day,
@@ -880,8 +872,8 @@ def write_rows(spreadsheet, sheet_name, header, rows, cols):
 
 def sort_meta_rows(rows):
     scope_order = {
-        "campaign": 0,
-        "ad_day": 1,
+        "day": 0,
+        "ad_month": 1,
         "campaign_gen": 2,
         "campaign_age": 3,
         "campaign_pf": 4,
@@ -927,13 +919,14 @@ def sort_google_rows(rows):
     }
 
     def sort_key(row):
-        _media, scope, month, day, channel, campaign, _value = row
+        media, scope, month, day, channel, campaign, _value = row
         date_value = day or month or ""
         date_num = int(date_value.replace("-", "")) if date_value else 0
 
         return (
             scope_order.get(scope, 999),
             -date_num,
+            media,
             channel,
             campaign,
         )
