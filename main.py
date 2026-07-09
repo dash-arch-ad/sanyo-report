@@ -10,9 +10,8 @@ META_API_VERSION = "v25.0"
 GOOGLE_ADS_API_VERSION = "v24"
 JST = ZoneInfo("Asia/Tokyo")
 
-META_WORKSHEET_NAME = "gitreport"
-GOOGLE_WORKSHEET_NAME = "gitreport2"
-
+DEFAULT_META_WORKSHEET_NAME = "gitreport"
+DEFAULT_GOOGLE_WORKSHEET_NAME = "gitreport2"
 GOOGLE_MAX_DAYS = 92
 
 GOOGLE_CHANNELS = {
@@ -40,23 +39,15 @@ def main():
     meta_monthly_ranges, meta_daily_since, meta_daily_until = get_meta_target_ranges()
     google_monthly_ranges, google_daily_since, google_daily_until = get_google_target_ranges()
 
-    print("Meta monthly ranges:")
-    for r in meta_monthly_ranges:
-        print(f"- {r['month']} / {r['since']} to {r['until']}")
-    print(f"Meta daily range: {meta_daily_since} to {meta_daily_until}")
-
-    print("Google monthly ranges:")
-    for r in google_monthly_ranges:
-        print(f"- {r['month']} / {r['since']} to {r['until']}")
-    print(f"Google daily range: {google_daily_since} to {google_daily_until}")
-
-    meta_rows = fetch_meta_rows(
-        act_id=resolved["meta"]["account_id"],
-        token=resolved["meta"]["token"],
-        monthly_ranges=meta_monthly_ranges,
-        daily_since=meta_daily_since,
-        daily_until=meta_daily_until,
-    )
+    meta_rows = []
+    for account_id in resolved["meta"]["account_ids"]:
+        meta_rows.extend(fetch_meta_rows(
+            act_id=account_id,
+            token=resolved["meta"]["token"],
+            monthly_ranges=meta_monthly_ranges,
+            daily_since=meta_daily_since,
+            daily_until=meta_daily_until,
+        ))
 
     google_rows = fetch_google_rows(
         google_ads_conf=resolved["google_ads"],
@@ -104,9 +95,10 @@ def mask_sensitive_values(config):
     meta = config.get("meta", {})
     google_ads = config.get("google_ads", {})
 
+    values.append(meta.get("token"))
+    values.extend(meta.get("account_ids", []))
+
     values.extend([
-        meta.get("token"),
-        meta.get("account_id"),
         google_ads.get("developer_token"),
         google_ads.get("client_id"),
         google_ads.get("client_secret"),
@@ -125,6 +117,11 @@ def resolve_config(config):
     google_ads_conf = config.get("google_ads", {})
     sheets_conf = config.get("sheets", {})
 
+    account_ids = meta_conf.get("account_ids")
+    if not account_ids:
+        single_account_id = meta_conf.get("account_id") or config.get("m_act_id")
+        account_ids = [single_account_id] if single_account_id else []
+
     google_service_account = (
         config.get("gcp_service_account")
         or config.get("g_creds")
@@ -133,7 +130,7 @@ def resolve_config(config):
     return {
         "meta": {
             "token": meta_conf.get("token") or config.get("m_token"),
-            "account_ids": meta_conf.get("account_ids") or [meta_conf.get("account_id") or config.get("m_act_id")],
+            "account_ids": account_ids,
         },
         "google_ads": {
             "developer_token": google_ads_conf.get("developer_token"),
@@ -147,9 +144,17 @@ def resolve_config(config):
         },
         "sheet": {
             "spreadsheet_id": sheets_conf.get("spreadsheet_id") or config.get("s_id"),
-            "meta_worksheet_name": sheets_conf.get("meta_worksheet_name") or "gitreport",
-            "google_worksheet_name": sheets_conf.get("google_worksheet_name") or "gitreport2",
-            "google_service_account": normalize_google_service_account(google_service_account),
+            "meta_worksheet_name": (
+                sheets_conf.get("meta_worksheet_name")
+                or DEFAULT_META_WORKSHEET_NAME
+            ),
+            "google_worksheet_name": (
+                sheets_conf.get("google_worksheet_name")
+                or DEFAULT_GOOGLE_WORKSHEET_NAME
+            ),
+            "google_service_account": normalize_google_service_account(
+                google_service_account
+            ),
         },
     }
 
@@ -157,7 +162,7 @@ def resolve_config(config):
 def validate_config(resolved):
     required = {
         "meta.token": resolved["meta"]["token"],
-        "meta.account_id": resolved["meta"]["account_id"],
+        "meta.account_ids": resolved["meta"]["account_ids"],
         "google_ads.developer_token": resolved["google_ads"]["developer_token"],
         "google_ads.client_id": resolved["google_ads"]["client_id"],
         "google_ads.client_secret": resolved["google_ads"]["client_secret"],
@@ -218,7 +223,7 @@ def get_common_latest_month():
     else:
         latest_month_start = this_month_start
 
-    return today_jst, yesterday, latest_month_start
+    return yesterday, latest_month_start
 
 
 def build_monthly_ranges(start_month, end_month, yesterday, min_start_date=None):
@@ -252,8 +257,7 @@ def build_monthly_ranges(start_month, end_month, yesterday, min_start_date=None)
 
 
 def get_meta_target_ranges():
-    _today, yesterday, latest_month_start = get_common_latest_month()
-
+    yesterday, latest_month_start = get_common_latest_month()
     start_month = add_months(latest_month_start, -5)
 
     monthly_ranges = build_monthly_ranges(
@@ -269,11 +273,11 @@ def get_meta_target_ranges():
 
 
 def get_google_target_ranges():
-    _today, yesterday, latest_month_start = get_common_latest_month()
+    yesterday, latest_month_start = get_common_latest_month()
 
     max_since = yesterday - timedelta(days=GOOGLE_MAX_DAYS - 1)
-
     six_month_start = add_months(latest_month_start, -5)
+
     start_date = max(six_month_start, max_since)
     start_month = date(start_date.year, start_date.month, 1)
 
@@ -314,7 +318,6 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
 
         for item in campaign_rows:
             value = extract_instagram_profile_visits(item)
-
             if value <= 0:
                 continue
 
@@ -323,6 +326,7 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
                 month=month_range["month"],
                 day="",
                 campaign=item.get("campaign_name", ""),
+                adset="",
                 ad="",
                 gender="",
                 age="",
@@ -342,7 +346,6 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
 
     for item in ad_day_rows:
         value = extract_instagram_profile_visits(item)
-
         if value <= 0:
             continue
 
@@ -376,7 +379,6 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
 
         for item in gender_rows:
             value = extract_instagram_profile_visits(item)
-
             if value <= 0:
                 continue
 
@@ -385,6 +387,7 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
                 month=month_range["month"],
                 day="",
                 campaign=item.get("campaign_name", ""),
+                adset="",
                 ad="",
                 gender=item.get("gender", ""),
                 age="",
@@ -405,7 +408,6 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
 
         for item in age_rows:
             value = extract_instagram_profile_visits(item)
-
             if value <= 0:
                 continue
 
@@ -414,6 +416,7 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
                 month=month_range["month"],
                 day="",
                 campaign=item.get("campaign_name", ""),
+                adset="",
                 ad="",
                 gender="",
                 age=item.get("age", ""),
@@ -434,7 +437,6 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
 
         for item in platform_rows:
             value = extract_instagram_profile_visits(item)
-
             if value <= 0:
                 continue
 
@@ -443,6 +445,7 @@ def fetch_meta_rows(act_id, token, monthly_ranges, daily_since, daily_until):
                 month=month_range["month"],
                 day="",
                 campaign=item.get("campaign_name", ""),
+                adset="",
                 ad="",
                 gender="",
                 age="",
@@ -489,7 +492,7 @@ def fetch_meta_insights(
             response.raise_for_status()
         except requests.HTTPError as e:
             raise RuntimeError(
-                f"Meta API request failed. status={response.status_code}, body={truncate_text(response.text)}"
+                f"Meta API request failed. act_id={act_id}, status={response.status_code}, body={truncate_text(response.text)}"
             ) from e
 
         payload = response.json()
@@ -502,7 +505,6 @@ def fetch_meta_insights(
         all_rows.extend(payload.get("data", []))
 
         next_url = payload.get("paging", {}).get("next")
-
         if not next_url:
             break
 
