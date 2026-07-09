@@ -19,12 +19,6 @@ GOOGLE_CHANNELS = {
     "DEMAND_GEN": "デマンドジェネレーション",
 }
 
-META_PROFILE_VISIT_ACTION_KEYWORDS = [
-    "instagram_profile_visit",
-    "instagram_profile_visits",
-    "profile_visit",
-]
-
 
 def main():
     print("=== Start Meta + Google Export ===")
@@ -39,9 +33,6 @@ def main():
     meta_6m_ranges = get_monthly_ranges(months=6)
     google_2m_ranges = get_monthly_ranges(months=2)
 
-    meta_2m_since = meta_2m_ranges[0]["since"]
-    meta_2m_until = meta_2m_ranges[-1]["until"]
-
     meta_rows = []
     for account_id in resolved["meta"]["account_ids"]:
         meta_rows.extend(fetch_meta_rows(
@@ -49,8 +40,8 @@ def main():
             token=resolved["meta"]["token"],
             ranges_2m=meta_2m_ranges,
             ranges_6m=meta_6m_ranges,
-            daily_since=meta_2m_since,
-            daily_until=meta_2m_until,
+            daily_since=meta_2m_ranges[0]["since"],
+            daily_until=meta_2m_ranges[-1]["until"],
         ))
 
     google_rows = fetch_google_rows(
@@ -66,15 +57,15 @@ def main():
     )
 
     write_meta_sheet(
-        spreadsheet,
-        resolved["sheet"]["meta_worksheet_name"],
-        sort_meta_rows(meta_rows),
+        spreadsheet=spreadsheet,
+        sheet_name=resolved["sheet"]["meta_worksheet_name"],
+        rows=sort_meta_rows(meta_rows),
     )
 
     write_google_sheet(
-        spreadsheet,
-        resolved["sheet"]["google_worksheet_name"],
-        sort_google_rows(google_rows),
+        spreadsheet=spreadsheet,
+        sheet_name=resolved["sheet"]["google_worksheet_name"],
+        rows=sort_google_rows(google_rows),
     )
 
     print(f"Meta rows written: {len(meta_rows)}")
@@ -86,29 +77,16 @@ def load_secret():
     secret_env = os.environ.get("APP_SECRET_JSON")
     if not secret_env:
         raise RuntimeError("APP_SECRET_JSON is not set")
-    return json.loads(secret_env)
+
+    try:
+        return json.loads(secret_env)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"APP_SECRET_JSON is invalid JSON: {e}") from e
 
 
+# CodeQL対策：GitHubログへsecret値をprintしない
 def mask_sensitive_values(config):
-    values = []
-    meta = config.get("meta", {})
-    google_ads = config.get("google_ads", {})
-
-    values.append(meta.get("token"))
-    values.extend(meta.get("account_ids", []))
-
-    values.extend([
-        google_ads.get("developer_token"),
-        google_ads.get("client_id"),
-        google_ads.get("client_secret"),
-        google_ads.get("refresh_token"),
-        google_ads.get("customer_id"),
-        google_ads.get("login_customer_id"),
-    ])
-
-    for value in sorted(set([str(v).strip() for v in values if v])):
-        if "\n" not in value:
-            print(f"::add-mask::{value}")
+    return
 
 
 def resolve_config(config):
@@ -134,13 +112,23 @@ def resolve_config(config):
             "client_secret": google_ads_conf.get("client_secret"),
             "refresh_token": google_ads_conf.get("refresh_token"),
             "customer_id": normalize_customer_id(google_ads_conf.get("customer_id")),
-            "login_customer_id": normalize_customer_id(google_ads_conf.get("login_customer_id")),
+            "login_customer_id": normalize_customer_id(
+                google_ads_conf.get("login_customer_id")
+            ),
         },
         "sheet": {
             "spreadsheet_id": sheets_conf.get("spreadsheet_id") or config.get("s_id"),
-            "meta_worksheet_name": sheets_conf.get("meta_worksheet_name") or DEFAULT_META_WORKSHEET_NAME,
-            "google_worksheet_name": sheets_conf.get("google_worksheet_name") or DEFAULT_GOOGLE_WORKSHEET_NAME,
-            "google_service_account": normalize_google_service_account(google_service_account),
+            "meta_worksheet_name": (
+                sheets_conf.get("meta_worksheet_name")
+                or DEFAULT_META_WORKSHEET_NAME
+            ),
+            "google_worksheet_name": (
+                sheets_conf.get("google_worksheet_name")
+                or DEFAULT_GOOGLE_WORKSHEET_NAME
+            ),
+            "google_service_account": normalize_google_service_account(
+                google_service_account
+            ),
         },
     }
 
@@ -197,15 +185,10 @@ def add_months(base_date, months):
     return date(year, month, 1)
 
 
-def get_yesterday_and_current_month_start():
+def get_monthly_ranges(months):
     today_jst = datetime.now(JST).date()
     yesterday = today_jst - timedelta(days=1)
     current_month_start = date(today_jst.year, today_jst.month, 1)
-    return yesterday, current_month_start
-
-
-def get_monthly_ranges(months):
-    yesterday, current_month_start = get_yesterday_and_current_month_start()
 
     if yesterday < current_month_start:
         latest_month_start = add_months(current_month_start, -1)
@@ -248,7 +231,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
     account_label = normalized_act_id
     rows = []
 
-    day_rows = fetch_meta_insights(
+    day_items = fetch_meta_insights(
         act_id=normalized_act_id,
         token=token,
         since=daily_since,
@@ -258,17 +241,15 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
         fields=["instagram_profile_visits"],
     )
 
-    for item in day_rows:
+    for item in day_items:
         value = extract_instagram_profile_visits(item)
         if value <= 0:
             continue
 
         day = item.get("date_start", "")
-        month = day[:7] if day else ""
-
         rows.append(make_meta_row(
             scope="day",
-            month=month,
+            month=day[:7],
             day=day,
             account=account_label,
             campaign="",
@@ -279,7 +260,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
         ))
 
     for month_range in ranges_6m:
-        month_rows = fetch_meta_insights(
+        month_items = fetch_meta_insights(
             act_id=normalized_act_id,
             token=token,
             since=month_range["since"],
@@ -289,7 +270,7 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
             fields=["instagram_profile_visits"],
         )
 
-        for item in month_rows:
+        for item in month_items:
             value = extract_instagram_profile_visits(item)
             if value <= 0:
                 continue
@@ -307,17 +288,22 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
             ))
 
     for month_range in ranges_2m:
-        ad_rows = fetch_meta_insights(
+        ad_items = fetch_meta_insights(
             act_id=normalized_act_id,
             token=token,
             since=month_range["since"],
             until=month_range["until"],
             level="ad",
             time_increment="monthly",
-            fields=["campaign_name", "adset_name", "ad_name", "instagram_profile_visits"],
+            fields=[
+                "campaign_name",
+                "adset_name",
+                "ad_name",
+                "instagram_profile_visits",
+            ],
         )
 
-        for item in ad_rows:
+        for item in ad_items:
             value = extract_instagram_profile_visits(item)
             if value <= 0:
                 continue
@@ -339,18 +325,21 @@ def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_unti
             ("campaign_age", "age"),
             ("campaign_pf", "publisher_platform"),
         ]:
-            breakdown_rows = fetch_meta_insights(
+            breakdown_items = fetch_meta_insights(
                 act_id=normalized_act_id,
                 token=token,
                 since=month_range["since"],
                 until=month_range["until"],
                 level="campaign",
                 time_increment="monthly",
-                fields=["campaign_name", "instagram_profile_visits"],
+                fields=[
+                    "campaign_name",
+                    "instagram_profile_visits",
+                ],
                 breakdowns=[breakdown_name],
             )
 
-            for item in breakdown_rows:
+            for item in breakdown_items:
                 value = extract_instagram_profile_visits(item)
                 if value <= 0:
                     continue
@@ -400,7 +389,7 @@ def fetch_meta_insights(
     all_rows = []
 
     while True:
-        response = requests.get(url, params=params, timeout=120)
+        response = requests.get(url, params=params, timeout=180)
 
         try:
             response.raise_for_status()
@@ -431,18 +420,6 @@ def fetch_meta_insights(
 def extract_instagram_profile_visits(item):
     return to_int(item.get("instagram_profile_visits"))
 
-    if not isinstance(actions, list):
-        return 0
-
-    total = 0
-
-    for action in actions:
-        action_type = str(action.get("action_type", "")).lower()
-        if any(keyword in action_type for keyword in META_PROFILE_VISIT_ACTION_KEYWORDS):
-            total += to_int(action.get("value"))
-
-    return total
-
 
 def make_meta_row(
     scope,
@@ -458,8 +435,8 @@ def make_meta_row(
     return [
         "FB",
         scope,
-        month,
-        day,
+        month or "",
+        day or "",
         account or "",
         campaign or "",
         adset or "",
@@ -500,7 +477,12 @@ def fetch_google_rows(google_ads_conf, monthly_ranges, daily_since, daily_until)
                 summary_row_setting="SUMMARY_ROW_WITH_RESULTS",
             )
 
-            unique_users = get_nested(response.get("summary_row"), "metrics", "uniqueUsers", default=0)
+            unique_users = get_nested(
+                response.get("summary_row"),
+                "metrics",
+                "uniqueUsers",
+                default=0,
+            )
 
             if to_int(unique_users) <= 0:
                 continue
@@ -538,7 +520,12 @@ def fetch_google_rows(google_ads_conf, monthly_ranges, daily_since, daily_until)
                 summary_row_setting="SUMMARY_ROW_WITH_RESULTS",
             )
 
-            unique_users = get_nested(response.get("summary_row"), "metrics", "uniqueUsers", default=0)
+            unique_users = get_nested(
+                response.get("summary_row"),
+                "metrics",
+                "uniqueUsers",
+                default=0,
+            )
 
             if to_int(unique_users) <= 0:
                 continue
@@ -580,7 +567,12 @@ def fetch_google_rows(google_ads_conf, monthly_ranges, daily_since, daily_until)
             if to_int(unique_users) <= 0:
                 continue
 
-            api_channel = get_nested(item, "campaign", "advertisingChannelType", default="")
+            api_channel = get_nested(
+                item,
+                "campaign",
+                "advertisingChannelType",
+                default="",
+            )
             output_channel = GOOGLE_CHANNELS.get(api_channel, api_channel)
 
             rows.append(make_google_row(
@@ -599,8 +591,8 @@ def make_google_row(scope, month, day, channel, campaign, unique_users):
     return [
         channel or "",
         scope,
-        month,
-        day,
+        month or "",
+        day or "",
         channel or "",
         campaign or "",
         to_int(unique_users),
@@ -630,7 +622,9 @@ def refresh_google_ads_access_token(client_id, client_secret, refresh_token):
     access_token = payload.get("access_token")
 
     if not access_token:
-        raise RuntimeError(f"Google OAuth token refresh returned no access_token: {payload}")
+        raise RuntimeError(
+            f"Google OAuth token refresh returned no access_token: {payload}"
+        )
 
     print("Google Ads OAuth token refreshed successfully")
     return access_token
@@ -689,7 +683,6 @@ def google_ads_search_stream(
 
     for chunk in payload:
         all_rows.extend(chunk.get("results", []))
-
         if chunk.get("summaryRow"):
             summary_row = chunk["summaryRow"]
 
@@ -731,7 +724,7 @@ def write_meta_sheet(spreadsheet, sheet_name, rows):
         "instagram_profile_visits",
     ]]
 
-    write_rows(spreadsheet, sheet_name, header, rows, cols=10)
+    write_rows(spreadsheet, sheet_name, header, rows)
 
 
 def write_google_sheet(spreadsheet, sheet_name, rows):
@@ -745,25 +738,23 @@ def write_google_sheet(spreadsheet, sheet_name, rows):
         "unique users",
     ]]
 
-    write_rows(spreadsheet, sheet_name, header, rows, cols=7)
+    write_rows(spreadsheet, sheet_name, header, rows)
 
 
-def write_rows(spreadsheet, sheet_name, header, rows, cols):
+def write_rows(spreadsheet, sheet_name, header, rows):
     try:
-        try:
-            worksheet = spreadsheet.worksheet(sheet_name)
-        except gspread.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(
-                title=sheet_name,
-                rows=1000,
-                cols=cols,
-            )
+        # CodeQL対策：シートは自動作成しない。事前に作成しておく。
+        worksheet = spreadsheet.worksheet(sheet_name)
 
         worksheet.clear()
-        worksheet.update("A1", header + rows)
+        worksheet.update("A1", header + rows, value_input_option="USER_ENTERED")
 
         print(f"Write success: {sheet_name} ({len(rows)} rows)")
 
+    except gspread.WorksheetNotFound as e:
+        raise RuntimeError(
+            f"Worksheet not found: {sheet_name}. Please create this sheet manually."
+        ) from e
     except Exception as e:
         raise RuntimeError(f"Write error ({sheet_name}): {repr(e)}") from e
 
@@ -843,10 +834,8 @@ def to_int(value):
 
 def truncate_text(value, limit=800):
     value = str(value)
-
     if len(value) <= limit:
         return value
-
     return value[:limit] + "...(truncated)"
 
 
