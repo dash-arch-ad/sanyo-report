@@ -34,9 +34,10 @@ def main():
     google_2m_ranges = get_monthly_ranges(months=2)
 
     meta_rows = []
-    for account_id in resolved["meta"]["account_ids"]:
+    for account in resolved["meta"]["accounts"]:
         meta_rows.extend(fetch_meta_rows(
-            act_id=account_id,
+            act_id=account["id"],
+            account_name=account["name"],
             token=resolved["meta"]["token"],
             ranges_2m=meta_2m_ranges,
             ranges_6m=meta_6m_ranges,
@@ -104,7 +105,7 @@ def resolve_config(config):
     return {
         "meta": {
             "token": meta_conf.get("token") or config.get("m_token"),
-            "account_ids": account_ids,
+            "accounts": meta_conf.get("accounts", []),
         },
         "google_ads": {
             "developer_token": google_ads_conf.get("developer_token"),
@@ -136,7 +137,7 @@ def resolve_config(config):
 def validate_config(resolved):
     required = {
         "meta.token": resolved["meta"]["token"],
-        "meta.account_ids": resolved["meta"]["account_ids"],
+        "meta.accounts": resolved["meta"]["accounts"],
         "google_ads.developer_token": resolved["google_ads"]["developer_token"],
         "google_ads.client_id": resolved["google_ads"]["client_id"],
         "google_ads.client_secret": resolved["google_ads"]["client_secret"],
@@ -226,9 +227,9 @@ def iter_dates(since, until):
         current += timedelta(days=1)
 
 
-def fetch_meta_rows(act_id, token, ranges_2m, ranges_6m, daily_since, daily_until):
+def fetch_meta_rows(act_id, account_name, token, ranges_2m, ranges_6m, daily_since, daily_until):
     normalized_act_id = normalize_meta_act_id(act_id)
-    account_label = normalized_act_id
+    account_label = account_name
     rows = []
 
     day_items = fetch_meta_insights(
