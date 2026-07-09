@@ -374,7 +374,7 @@ def fetch_meta_rows(
                 since=month_range["since"],
                 until=month_range["until"],
                 level="campaign",
-                time_increment="monthly",
+                time_increment="1",
                 fields=[
                     "campaign_name",
                     "instagram_profile_visits",
@@ -387,10 +387,13 @@ def fetch_meta_rows(
                 if value <= 0:
                     continue
 
+                day = item.get("date_start", "")
+                month = day[:7] if day else month_range["month"]
+
                 rows.append(make_meta_row(
                     scope=scope_name,
-                    month=month_range["month"],
-                    day="",
+                    month=month,
+                    day=day,
                     account=account_label,
                     campaign=item.get("campaign_name", ""),
                     adset="",
