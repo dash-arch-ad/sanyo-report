@@ -793,8 +793,6 @@ def write_rows(spreadsheet, sheet_name, header, rows):
         worksheet.clear()
         worksheet.update("A1", header + rows, value_input_option="USER_ENTERED")
 
-        print(f"Write success: {sheet_name} ({len(rows)} rows)")
-
     except gspread.WorksheetNotFound as e:
         raise RuntimeError(
             f"Worksheet not found: {sheet_name}. Please create this sheet manually."
